@@ -1,308 +1,564 @@
 using BepInEx;
 using BepInEx.Logging;
+using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
-using UnityEngine;
 
-[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "4.0.0")]
+[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "5.0.0")]
 public class NetworkPainterServer : BaseUnityPlugin
 {
-    private static ManualLogSource Log;
-    private readonly Dictionary<int, int> lastColors = new Dictionary<int, int>();
-    private Type structureType;
-    private float nextScan;
-    private bool baselineReady;
+    internal static ManualLogSource Log;
+    internal static bool Propagating;
+    private Harmony _harmony;
 
     private void Awake()
     {
         Log = Logger;
-        Log.LogInfo("Network Painter Server 4.0.0 starting");
-        structureType = FindType("Assets.Scripts.Objects.Structure");
-        if (structureType == null)
-        {
-            Log.LogError("Could not find Assets.Scripts.Objects.Structure");
-            return;
-        }
-        Log.LogInfo("Structure type: " + structureType.FullName);
-        Log.LogInfo("Network Painter Server ready. Watching server-side color state...");
-    }
+        Log.LogInfo("Network Painter Server 5.0.0 starting");
+        _harmony = new Harmony("dominic.networkpainterserver.v5");
 
-    private void Update()
-    {
-        if (structureType == null) return;
-        if (Time.realtimeSinceStartup < nextScan) return;
-        nextScan = Time.realtimeSinceStartup + 0.25f;
-        ScanStructures();
-    }
+        Assembly game = typeof(Assets.Scripts.Objects.Thing).Assembly;
+        int patched = 0;
 
-    private void ScanStructures()
-    {
-        UnityEngine.Object[] objs;
-        try { objs = UnityEngine.Object.FindObjectsOfType(structureType); }
-        catch (Exception e)
+        foreach (Type t in SafeTypes(game))
         {
-            Log.LogError("FindObjectsOfType failed: " + e);
-            return;
-        }
-
-        int readable = 0;
-        if (!baselineReady)
-        {
-            lastColors.Clear();
-            foreach (UnityEngine.Object obj in objs)
+            foreach (MethodInfo m in SafeMethods(t))
             {
-                int color;
-                if (!TryGetColor(obj, out color)) continue;
-                readable++;
-                lastColors[obj.GetInstanceID()] = color;
-            }
-            baselineReady = true;
-            Log.LogInfo("Color baseline ready. Found " + objs.Length + " structures; tracking " + readable + " color-readable structures.");
-            return;
-        }
+                bool wanted =
+                    m.Name == "set_CustomColorIndex" ||
+                    m.Name == "OnColourChange" ||
+                    m.Name == "OnColourChangeEvent" ||
+                    HasThingColorMessage(m);
 
-        foreach (UnityEngine.Object obj in objs)
-        {
-            int color;
-            if (!TryGetColor(obj, out color)) continue;
-            int id = obj.GetInstanceID();
-            int old;
-            if (!lastColors.TryGetValue(id, out old))
-            {
-                lastColors[id] = color;
-                continue;
-            }
-            if (old == color) continue;
-            lastColors[id] = color;
-            Log.LogInfo("Detected color change: " + obj.GetType().FullName + " '" + obj.name + "' " + old + " -> " + color);
-            Propagate(obj, color);
-        }
-    }
+                if (!wanted) continue;
 
-    private void Propagate(object source, int color)
-    {
-        object network;
-        string networkKind;
-        if (!TryGetNetwork(source, out network, out networkKind))
-        {
-            Log.LogInfo("Changed structure has no readable cable/pipe/chute/structure network.");
-            return;
-        }
-        Log.LogInfo("Found " + networkKind + ": " + network.GetType().FullName);
-
-        IEnumerable members;
-        if (!TryGetMembers(network, out members))
-        {
-            Log.LogWarning("Could not read network member list from " + network.GetType().FullName);
-            DumpCandidateMembers(network.GetType(), "network");
-            return;
-        }
-
-        int found = 0, changed = 0, failed = 0;
-        foreach (object member in members)
-        {
-            if (member == null) continue;
-            found++;
-            int current;
-            if (TryGetColor(member, out current) && current == color) continue;
-            if (TrySetColor(member, color))
-            {
-                changed++;
-                UnityEngine.Object uo = member as UnityEngine.Object;
-                if (uo != null) lastColors[uo.GetInstanceID()] = color;
-            }
-            else failed++;
-        }
-        Log.LogInfo("Network paint complete: found " + found + " member(s), changed " + changed + ", failed " + failed + ".");
-    }
-
-    private bool TryGetColor(object obj, out int color)
-    {
-        color = -1;
-        try
-        {
-            MethodInfo m = FindZeroArgMethod(obj.GetType(), "get_CustomColorIndex");
-            if (m == null) return false;
-            object v = m.Invoke(obj, null);
-            color = Convert.ToInt32(v);
-            return true;
-        }
-        catch { return false; }
-    }
-
-    private bool TrySetColor(object obj, int color)
-    {
-        Type t = obj.GetType();
-        try
-        {
-            foreach (MethodInfo m in GetAllMethods(t, "SetCustomColor"))
-            {
-                ParameterInfo[] p = m.GetParameters();
-                if (p.Length < 1 || p.Length > 2) continue;
-                object c;
-                if (!TryConvert(color, p[0].ParameterType, out c)) continue;
-                object[] args;
-                if (p.Length == 1) args = new object[] { c };
-                else
+                try
                 {
-                    object second = p[1].HasDefaultValue ? p[1].DefaultValue : DefaultValue(p[1].ParameterType);
-                    args = new object[] { c, second };
+                    HarmonyMethod postfix = new HarmonyMethod(
+                        typeof(NetworkPainterServer),
+                        m.IsStatic ? nameof(StaticPostfix) : nameof(InstancePostfix));
+
+                    _harmony.Patch(m, postfix: postfix);
+                    patched++;
+                    Log.LogInfo("Patched event hook: " + Describe(m));
                 }
-                m.Invoke(obj, args);
-                return true;
-            }
-
-            MethodInfo setter = FindOneArgMethod(t, "set_CustomColorIndex");
-            if (setter != null)
-            {
-                ParameterInfo p = setter.GetParameters()[0];
-                object c;
-                if (TryConvert(color, p.ParameterType, out c))
+                catch (Exception e)
                 {
-                    setter.Invoke(obj, new object[] { c });
-                    return true;
+                    Log.LogWarning("Could not patch " + Describe(m) + ": " + e.Message);
                 }
             }
         }
-        catch (Exception e)
-        {
-            Log.LogWarning("Set color failed on " + t.FullName + ": " + e.GetType().Name + " - " + e.Message);
-        }
-        return false;
+
+        Log.LogInfo("Network Painter Server ready. Event hooks patched: " + patched);
     }
 
-    private bool TryGetNetwork(object obj, out object network, out string kind)
+    private void OnDestroy()
     {
-        string[] names = { "get_CableNetwork", "get_PipeNetwork", "get_ChuteNetwork", "get_StructureNetwork" };
-        foreach (string name in names)
+        try
+        {
+            if (_harmony != null) _harmony.UnpatchSelf();
+        }
+        catch { }
+    }
+
+    public static void InstancePostfix(object __instance, object[] __args)
+    {
+        if (Propagating) return;
+        try
+        {
+            object source = FindStructure(__instance, __args);
+            if (source == null) return;
+            HandleColorChange(source);
+        }
+        catch (Exception e)
+        {
+            if (Log != null) Log.LogError("Paint event error: " + e);
+        }
+    }
+
+    public static void StaticPostfix(object[] __args)
+    {
+        if (Propagating) return;
+        try
+        {
+            object source = FindStructure(null, __args);
+            if (source == null)
+            {
+                DumpMessageArgs(__args);
+                return;
+            }
+            HandleColorChange(source);
+        }
+        catch (Exception e)
+        {
+            if (Log != null) Log.LogError("Static paint event error: " + e);
+        }
+    }
+
+    private static void HandleColorChange(object source)
+    {
+        MethodInfo colorGetter = FindMethod(source.GetType(), "get_CustomColorIndex", 0);
+        if (colorGetter == null)
+        {
+            Log.LogWarning("Paint event hit " + source.GetType().FullName + " but get_CustomColorIndex was not found.");
+            return;
+        }
+
+        object color;
+        try
+        {
+            color = colorGetter.Invoke(source, null);
+        }
+        catch (Exception e)
+        {
+            Log.LogWarning("Could not read source color: " + e.Message);
+            return;
+        }
+
+        object network = GetNetwork(source);
+        if (network == null)
+        {
+            Log.LogInfo("Color changed on " + source.GetType().Name + ", but no structure network was found.");
+            return;
+        }
+
+        IEnumerable members = GetStructureList(network);
+        if (members == null)
+        {
+            Log.LogWarning("Found network " + network.GetType().FullName + " but could not read StructureList.");
+            DumpUsefulMembers(network.GetType(), "network");
+            return;
+        }
+
+        int found = 0;
+        int changed = 0;
+        int failed = 0;
+
+        Propagating = true;
+        try
+        {
+            foreach (object member in members)
+            {
+                if (member == null) continue;
+                found++;
+                if (ReferenceEquals(member, source)) continue;
+
+                object current = ReadColor(member);
+                if (ColorsEqual(current, color)) continue;
+
+                if (ApplyColor(member, color)) changed++;
+                else failed++;
+            }
+        }
+        finally
+        {
+            Propagating = false;
+        }
+
+        Log.LogInfo(
+            "NETWORK PAINT: source=" + source.GetType().Name +
+            " network=" + network.GetType().Name +
+            " color=" + SafeValue(color) +
+            " members=" + found +
+            " changed=" + changed +
+            " failed=" + failed);
+    }
+
+    private static object GetNetwork(object source)
+    {
+        string[] getters =
+        {
+            "get_StructureNetwork",
+            "get_CableNetwork",
+            "get_PipeNetwork",
+            "get_ChuteNetwork"
+        };
+
+        foreach (string name in getters)
+        {
+            MethodInfo m = FindMethod(source.GetType(), name, 0);
+            if (m == null) continue;
+
+            try
+            {
+                object network = m.Invoke(source, null);
+                if (network != null)
+                {
+                    Log.LogInfo("Found network using " + name + ": " + network.GetType().FullName);
+                    return network;
+                }
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable GetStructureList(object network)
+    {
+        MethodInfo getter = FindMethod(network.GetType(), "get_StructureList", 0);
+        if (getter != null)
         {
             try
             {
-                MethodInfo m = FindZeroArgMethod(obj.GetType(), name);
-                if (m == null) continue;
-                object n = m.Invoke(obj, null);
-                if (n == null) continue;
-                network = n;
-                kind = name.Substring(4);
+                object value = getter.Invoke(network, null);
+                IEnumerable enumerable = value as IEnumerable;
+                if (enumerable != null) return enumerable;
+            }
+            catch { }
+        }
+
+        Type t = network.GetType();
+        while (t != null)
+        {
+            try
+            {
+                FieldInfo f = t.GetField(
+                    "StructureList",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (f != null)
+                {
+                    IEnumerable enumerable = f.GetValue(network) as IEnumerable;
+                    if (enumerable != null) return enumerable;
+                }
+            }
+            catch { }
+            t = t.BaseType;
+        }
+
+        return null;
+    }
+
+    private static object ReadColor(object obj)
+    {
+        MethodInfo getter = FindMethod(obj.GetType(), "get_CustomColorIndex", 0);
+        if (getter == null) return null;
+        try { return getter.Invoke(obj, null); }
+        catch { return null; }
+    }
+
+    private static bool ApplyColor(object target, object sourceColor)
+    {
+        Type t = target.GetType();
+
+        foreach (MethodInfo m in FindMethods(t, "SetCustomColor"))
+        {
+            ParameterInfo[] p = m.GetParameters();
+            if (p.Length < 1 || p.Length > 3) continue;
+
+            try
+            {
+                object[] args = new object[p.Length];
+                args[0] = ConvertValue(sourceColor, p[0].ParameterType);
+
+                for (int i = 1; i < p.Length; i++)
+                {
+                    if (p[i].ParameterType == typeof(bool))
+                        args[i] = true;
+                    else if (p[i].HasDefaultValue)
+                        args[i] = p[i].DefaultValue;
+                    else if (p[i].ParameterType.IsValueType)
+                        args[i] = Activator.CreateInstance(p[i].ParameterType);
+                    else
+                        args[i] = null;
+                }
+
+                m.Invoke(target, args);
                 return true;
             }
             catch { }
         }
-        network = null;
-        kind = null;
+
+        MethodInfo setter = FindMethod(t, "set_CustomColorIndex", 1);
+        if (setter != null)
+        {
+            try
+            {
+                Type pt = setter.GetParameters()[0].ParameterType;
+                setter.Invoke(target, new object[] { ConvertValue(sourceColor, pt) });
+                return true;
+            }
+            catch { }
+        }
+
         return false;
     }
 
-    private bool TryGetMembers(object network, out IEnumerable members)
+    private static object ConvertValue(object value, Type targetType)
     {
-        members = null;
+        if (value == null)
+        {
+            if (targetType.IsValueType) return Activator.CreateInstance(targetType);
+            return null;
+        }
+
+        Type sourceType = value.GetType();
+        if (targetType.IsAssignableFrom(sourceType)) return value;
+
+        if (targetType.IsEnum)
+        {
+            int n = Convert.ToInt32(value);
+            return Enum.ToObject(targetType, n);
+        }
+
+        if (sourceType.IsEnum)
+        {
+            int n = Convert.ToInt32(value);
+            return Convert.ChangeType(n, targetType);
+        }
+
+        return Convert.ChangeType(value, targetType);
+    }
+
+    private static bool ColorsEqual(object a, object b)
+    {
+        if (a == null || b == null) return false;
+        try { return Convert.ToInt32(a) == Convert.ToInt32(b); }
+        catch { return a.Equals(b); }
+    }
+
+    private static object FindStructure(object instance, object[] args)
+    {
+        object s = AsStructure(instance);
+        if (s != null) return s;
+
+        if (args != null)
+        {
+            foreach (object a in args)
+            {
+                s = AsStructure(a);
+                if (s != null) return s;
+
+                s = FindStructureInsideMessage(a);
+                if (s != null) return s;
+            }
+        }
+
+        return null;
+    }
+
+    private static object AsStructure(object obj)
+    {
+        if (obj == null) return null;
+        Type t = obj.GetType();
+        while (t != null)
+        {
+            if (t.FullName == "Assets.Scripts.Objects.Structure") return obj;
+            t = t.BaseType;
+        }
+        return null;
+    }
+
+    private static object FindStructureInsideMessage(object msg)
+    {
+        if (msg == null) return null;
+        Type t = msg.GetType();
+        if (t.Name.IndexOf("Color", StringComparison.OrdinalIgnoreCase) < 0 &&
+            t.Name.IndexOf("Colour", StringComparison.OrdinalIgnoreCase) < 0)
+            return null;
+
+        foreach (FieldInfo f in SafeFields(t))
+        {
+            try
+            {
+                object value = f.GetValue(msg);
+                object s = AsStructure(value);
+                if (s != null) return s;
+            }
+            catch { }
+        }
+
+        foreach (PropertyInfo p in SafeProperties(t))
+        {
+            if (p.GetIndexParameters().Length != 0) continue;
+            try
+            {
+                object value = p.GetValue(msg, null);
+                object s = AsStructure(value);
+                if (s != null) return s;
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    private static bool HasThingColorMessage(MethodInfo m)
+    {
         try
         {
-            MethodInfo getter = FindZeroArgMethod(network.GetType(), "get_StructureList");
-            if (getter != null)
+            foreach (ParameterInfo p in m.GetParameters())
             {
-                object v = getter.Invoke(network, null);
-                members = v as IEnumerable;
-                if (members != null) return true;
+                string n = p.ParameterType.FullName ?? p.ParameterType.Name;
+                if (n.IndexOf("ThingColorMessage", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
             }
         }
         catch { }
-
-        string[] methodNames = { "get_Structures", "get_ConnectedStructures", "get_Members" };
-        foreach (string name in methodNames)
-        {
-            try
-            {
-                MethodInfo m = FindZeroArgMethod(network.GetType(), name);
-                if (m == null) continue;
-                IEnumerable e = m.Invoke(network, null) as IEnumerable;
-                if (e != null) { members = e; return true; }
-            }
-            catch { }
-        }
         return false;
     }
 
-    private static Type FindType(string fullName)
+    private static MethodInfo FindMethod(Type type, string name, int parameterCount)
     {
-        foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            Type t = a.GetType(fullName, false);
-            if (t != null) return t;
-        }
-        return null;
-    }
-
-    private static MethodInfo FindZeroArgMethod(Type t, string name)
-    {
+        Type t = type;
         while (t != null)
         {
-            MethodInfo m = t.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
-            if (m != null) return m;
+            try
+            {
+                foreach (MethodInfo m in t.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly))
+                {
+                    if (m.Name == name && m.GetParameters().Length == parameterCount)
+                        return m;
+                }
+            }
+            catch { }
             t = t.BaseType;
         }
         return null;
     }
 
-    private static MethodInfo FindOneArgMethod(Type t, string name)
+    private static IEnumerable<MethodInfo> FindMethods(Type type, string name)
     {
+        Type t = type;
         while (t != null)
         {
-            MethodInfo[] methods = t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
-            foreach (MethodInfo m in methods)
-                if (m.Name == name && m.GetParameters().Length == 1) return m;
-            t = t.BaseType;
-        }
-        return null;
-    }
+            MethodInfo[] methods;
+            try
+            {
+                methods = t.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+            }
+            catch
+            {
+                methods = new MethodInfo[0];
+            }
 
-    private static IEnumerable<MethodInfo> GetAllMethods(Type t, string name)
-    {
-        while (t != null)
-        {
-            MethodInfo[] methods = t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
             foreach (MethodInfo m in methods)
                 if (m.Name == name) yield return m;
+
             t = t.BaseType;
         }
     }
 
-    private static bool TryConvert(int value, Type type, out object result)
+    private static IEnumerable<Type> SafeTypes(Assembly a)
+    {
+        try { return a.GetTypes(); }
+        catch (ReflectionTypeLoadException e) { return e.Types.Where(x => x != null); }
+        catch { return new Type[0]; }
+    }
+
+    private static IEnumerable<MethodInfo> SafeMethods(Type t)
     {
         try
         {
-            if (type.IsEnum) result = Enum.ToObject(type, value);
-            else result = Convert.ChangeType(value, type);
-            return true;
+            return t.GetMethods(
+                BindingFlags.Instance | BindingFlags.Static |
+                BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly);
         }
-        catch { result = null; return false; }
+        catch { return new MethodInfo[0]; }
     }
 
-    private static object DefaultValue(Type t)
-    {
-        if (!t.IsValueType) return null;
-        return Activator.CreateInstance(t);
-    }
-
-    private void DumpCandidateMembers(Type t, string label)
+    private static IEnumerable<FieldInfo> SafeFields(Type t)
     {
         try
         {
-            List<string> hits = new List<string>();
-            Type cur = t;
-            while (cur != null)
+            return t.GetFields(
+                BindingFlags.Instance | BindingFlags.Public |
+                BindingFlags.NonPublic);
+        }
+        catch { return new FieldInfo[0]; }
+    }
+
+    private static IEnumerable<PropertyInfo> SafeProperties(Type t)
+    {
+        try
+        {
+            return t.GetProperties(
+                BindingFlags.Instance | BindingFlags.Public |
+                BindingFlags.NonPublic);
+        }
+        catch { return new PropertyInfo[0]; }
+    }
+
+    private static void DumpMessageArgs(object[] args)
+    {
+        if (Log == null || args == null) return;
+
+        foreach (object a in args)
+        {
+            if (a == null) continue;
+            Type t = a.GetType();
+            string n = t.FullName ?? t.Name;
+
+            if (n.IndexOf("Color", StringComparison.OrdinalIgnoreCase) < 0 &&
+                n.IndexOf("Colour", StringComparison.OrdinalIgnoreCase) < 0)
+                continue;
+
+            Log.LogInfo("Color message seen: " + n);
+
+            foreach (FieldInfo f in SafeFields(t))
             {
-                foreach (MethodInfo m in cur.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                try
                 {
-                    string n = m.Name.ToLowerInvariant();
-                    if (n.Contains("struct") || n.Contains("network") || n.Contains("member")) hits.Add(m.Name);
+                    Log.LogInfo("  field " + f.Name + "=" + SafeValue(f.GetValue(a)));
                 }
-                cur = cur.BaseType;
+                catch { }
             }
-            Log.LogInfo("Candidate " + label + " methods: " + string.Join(", ", hits.ToArray()));
         }
-        catch { }
+    }
+
+    private static void DumpUsefulMembers(Type t, string label)
+    {
+        if (Log == null) return;
+        Log.LogInfo("Useful members on " + label + " type " + t.FullName + ":");
+
+        Type cur = t;
+        while (cur != null)
+        {
+            foreach (MethodInfo m in SafeMethods(cur))
+            {
+                string n = m.Name;
+                if (n.IndexOf("Structure", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("Network", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("Color", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("Colour", StringComparison.OrdinalIgnoreCase) >= 0)
+                    Log.LogInfo("  " + Describe(m));
+            }
+            cur = cur.BaseType;
+        }
+    }
+
+    private static string Describe(MethodInfo m)
+    {
+        string[] p;
+        try
+        {
+            p = m.GetParameters()
+                .Select(x => x.ParameterType.Name + " " + x.Name)
+                .ToArray();
+        }
+        catch
+        {
+            p = new string[0];
+        }
+
+        return (m.DeclaringType != null ? m.DeclaringType.FullName : "?") +
+               "." + m.Name + "(" + string.Join(", ", p) + ")";
+    }
+
+    private static string SafeValue(object value)
+    {
+        if (value == null) return "null";
+        try { return value.ToString(); }
+        catch { return "<unprintable>"; }
     }
 }
