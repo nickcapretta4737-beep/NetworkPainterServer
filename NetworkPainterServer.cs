@@ -5,285 +5,369 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
-[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "10.0.0")]
+[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "11.0.0")]
 public class NetworkPainterServer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
+    internal static Assembly GameAssembly;
     internal static Type StructureType;
-    internal static readonly Dictionary<int, int> LastColors = new Dictionary<int, int>();
+    internal static Type ThingColorMessageType;
+    internal static readonly Dictionary<long, int> LastColors = new Dictionary<long, int>();
+    internal static readonly List<RegistryAccessor> Registries = new List<RegistryAccessor>();
     internal static bool BaselineReady;
     internal static bool Propagating;
+    internal static bool TickSeen;
     internal static long NextScanMs;
-    internal static bool FirstTickLogged;
     private Harmony harmony;
 
     private void Awake()
     {
         Log = Logger;
-        Log.LogInfo("Network Painter Server 10.0.0 starting");
+        Log.LogInfo("Network Painter Server 11.0.0 starting");
 
-        Assembly game = null;
         foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
         {
             try
             {
                 Type s = a.GetType("Assets.Scripts.Objects.Structure", false);
-                if (s != null)
-                {
-                    StructureType = s;
-                    game = a;
-                    break;
-                }
+                if (s == null) continue;
+                GameAssembly = a;
+                StructureType = s;
+                ThingColorMessageType = a.GetType("Assets.Scripts.Networking.ThingColorMessage", false);
+                break;
             }
             catch { }
         }
 
-        if (StructureType == null || game == null)
+        if (GameAssembly == null || StructureType == null)
         {
-            Log.LogError("Could not find Assets.Scripts.Objects.Structure");
+            Log.LogError("Could not locate the Stationeers game assembly.");
             return;
         }
 
-        Log.LogInfo("Structure type found: " + StructureType.FullName);
+        Log.LogInfo("Game assembly: " + GameAssembly.FullName);
+        Log.LogInfo("Structure type: " + StructureType.FullName);
+        Log.LogInfo("ThingColorMessage: " + (ThingColorMessageType == null ? "NOT FOUND" : ThingColorMessageType.FullName));
 
-        harmony = new Harmony("dominic.networkpainterserver.v10");
+        DiscoverNetworkRegistries();
 
-        string[] tickNames =
-        {
-            "OnMainTick",
-            "ServerTick",
-            "AllTick",
-            "OnLifeTick",
-            "ThingUpdate",
-            "SlowUpdate"
-        };
+        harmony = new Harmony("dominic.networkpainterserver.v11");
 
-        int patched = 0;
-
-        foreach (Type t in SafeTypes(game))
-        {
-            foreach (MethodInfo m in SafeMethods(t))
-            {
-                bool wanted = false;
-
-                foreach (string name in tickNames)
-                {
-                    if (m.Name == name)
-                    {
-                        wanted = true;
-                        break;
-                    }
-                }
-
-                if (!wanted || m.IsAbstract || m.ContainsGenericParameters)
-                    continue;
-
-                if (m.DeclaringType != null &&
-                    m.DeclaringType.Name.StartsWith("<"))
-                    continue;
-
-                try
-                {
-                    harmony.Patch(
-                        m,
-                        postfix: new HarmonyMethod(
-                            typeof(NetworkPainterServer),
-                            nameof(TickPostfix)));
-
-                    patched++;
-                    Log.LogInfo("Patched tick hook: " +
-                        m.DeclaringType.FullName + "." + m.Name);
-                }
-                catch (Exception e)
-                {
-                    Log.LogWarning("Could not patch tick hook " +
-                        m.DeclaringType.FullName + "." + m.Name +
-                        ": " + e.Message);
-                }
-            }
-        }
-
-        Log.LogInfo("Network Painter Server ready. Tick hooks patched=" + patched);
+        int tickHooks = PatchRealGameTick();
+        Log.LogInfo("Network Painter Server ready. GameTick hooks=" + tickHooks +
+                    ", network registries=" + Registries.Count);
     }
 
     private void OnDestroy()
     {
         try
         {
-            if (harmony != null)
-                harmony.UnpatchSelf();
+            if (harmony != null) harmony.UnpatchSelf();
         }
         catch { }
     }
 
-    public static void TickPostfix(MethodBase __originalMethod)
+    private int PatchRealGameTick()
     {
-        if (Propagating || StructureType == null)
-            return;
+        int count = 0;
+        Type gm = null;
 
-        long now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+        try { gm = GameAssembly.GetType("Assets.Scripts.GameManager", false); }
+        catch { }
 
-        if (!FirstTickLogged)
+        if (gm == null)
         {
-            FirstTickLogged = true;
-            Log.LogInfo("TICK HOOK ACTIVE: " +
-                (__originalMethod.DeclaringType != null
-                    ? __originalMethod.DeclaringType.FullName
-                    : "?") +
-                "." + __originalMethod.Name);
+            Log.LogError("Assets.Scripts.GameManager was not found.");
+            return 0;
         }
 
-        if (now < NextScanMs)
-            return;
+        Type[] nested;
+        try
+        {
+            nested = gm.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+        }
+        catch
+        {
+            nested = new Type[0];
+        }
 
+        foreach (Type t in nested)
+        {
+            if (t == null || !t.Name.StartsWith("<GameTick>d__", StringComparison.Ordinal))
+                continue;
+
+            MethodInfo moveNext = null;
+            try
+            {
+                moveNext = t.GetMethod(
+                    "MoveNext",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            }
+            catch { }
+
+            if (moveNext == null) continue;
+
+            try
+            {
+                harmony.Patch(
+                    moveNext,
+                    postfix: new HarmonyMethod(typeof(NetworkPainterServer), nameof(GameTickPostfix)));
+
+                count++;
+                Log.LogInfo("PATCHED REAL GAME TICK: " + t.FullName + ".MoveNext()");
+            }
+            catch (Exception e)
+            {
+                Log.LogError("Could not patch GameTick state machine: " + e);
+            }
+        }
+
+        if (count == 0)
+        {
+            MethodInfo gameTick = FindDeclaredMethod(gm, "GameTick");
+            if (gameTick != null)
+            {
+                try
+                {
+                    harmony.Patch(
+                        gameTick,
+                        postfix: new HarmonyMethod(typeof(NetworkPainterServer), nameof(GameTickPostfix)));
+
+                    count++;
+                    Log.LogInfo("PATCHED FALLBACK GAME TICK: " + gm.FullName + ".GameTick()");
+                }
+                catch (Exception e)
+                {
+                    Log.LogError("Could not patch GameManager.GameTick: " + e);
+                }
+            }
+        }
+
+        return count;
+    }
+
+    public static void GameTickPostfix()
+    {
+        if (Propagating || GameAssembly == null) return;
+
+        if (!TickSeen)
+        {
+            TickSeen = true;
+            Log.LogInfo("GAME TICK HOOK ACTIVE");
+        }
+
+        long now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+        if (now < NextScanMs) return;
         NextScanMs = now + 250;
 
         try
         {
-            Scan();
+            if (Registries.Count == 0)
+                DiscoverNetworkRegistries();
+
+            ScanNetworkRegistries();
         }
         catch (Exception e)
         {
-            Log.LogError("Network scan exception: " + e);
+            Log.LogError("Network registry scan exception: " + e);
         }
     }
 
-    private static void Scan()
+    private static void DiscoverNetworkRegistries()
     {
-        UnityEngine.Object[] objects;
+        Registries.Clear();
 
-        try
+        string[] wanted =
         {
-            objects = UnityEngine.Object.FindObjectsOfType(StructureType);
-        }
-        catch (Exception e)
+            "AllCableNetworks",
+            "AllPipeNetworks",
+            "AllChuteNetworks",
+            "AllStructureNetworks"
+        };
+
+        foreach (Type t in SafeTypes(GameAssembly))
         {
-            Log.LogError("Structure scan failed: " + e.Message);
-            return;
-        }
-
-        int readable = 0;
-
-        if (!BaselineReady)
-        {
-            LastColors.Clear();
-
-            foreach (UnityEngine.Object obj in objects)
+            foreach (string name in wanted)
             {
-                int? color = ReadColor(obj);
-                if (!color.HasValue)
+                FieldInfo f = null;
+                PropertyInfo p = null;
+
+                try
+                {
+                    f = t.GetField(
+                        name,
+                        BindingFlags.Static | BindingFlags.Instance |
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly);
+                }
+                catch { }
+
+                if (f != null)
+                {
+                    AddRegistry(new RegistryAccessor(t, name, f, null));
+                    continue;
+                }
+
+                try
+                {
+                    p = t.GetProperty(
+                        name,
+                        BindingFlags.Static | BindingFlags.Instance |
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly);
+                }
+                catch { }
+
+                if (p != null && p.GetIndexParameters().Length == 0)
+                    AddRegistry(new RegistryAccessor(t, name, null, p));
+            }
+        }
+
+        bool hasSpecific = false;
+        foreach (RegistryAccessor r in Registries)
+        {
+            if (r.Name == "AllCableNetworks" ||
+                r.Name == "AllPipeNetworks" ||
+                r.Name == "AllChuteNetworks")
+            {
+                hasSpecific = true;
+                break;
+            }
+        }
+
+        if (hasSpecific)
+            Registries.RemoveAll(r => r.Name == "AllStructureNetworks");
+
+        foreach (RegistryAccessor r in Registries)
+            Log.LogInfo("NETWORK REGISTRY FOUND: " + r.OwnerType.FullName + "." + r.Name);
+    }
+
+    private static void AddRegistry(RegistryAccessor candidate)
+    {
+        foreach (RegistryAccessor r in Registries)
+        {
+            if (r.OwnerType == candidate.OwnerType && r.Name == candidate.Name)
+                return;
+        }
+
+        Registries.Add(candidate);
+    }
+
+    private static void ScanNetworkRegistries()
+    {
+        int networkCount = 0;
+        int memberCount = 0;
+        int readableCount = 0;
+
+        foreach (RegistryAccessor registry in Registries)
+        {
+            object collection = registry.GetValue();
+            if (collection == null) continue;
+
+            foreach (object network in EnumerateCollection(collection))
+            {
+                if (network == null) continue;
+
+                networkCount++;
+
+                IEnumerable membersEnumerable = GetNetworkMembers(network);
+                if (membersEnumerable == null) continue;
+
+                List<object> members = new List<object>();
+                foreach (object member in membersEnumerable)
+                {
+                    if (member != null) members.Add(member);
+                }
+
+                if (members.Count == 0) continue;
+
+                memberCount += members.Count;
+
+                int? changedColor = null;
+                object changedMember = null;
+                bool conflict = false;
+
+                foreach (object member in members)
+                {
+                    int? color = ReadColor(member);
+                    if (!color.HasValue) continue;
+
+                    readableCount++;
+
+                    long key = GetStableKey(member);
+
+                    int oldColor;
+                    if (!LastColors.TryGetValue(key, out oldColor))
+                    {
+                        LastColors[key] = color.Value;
+                        continue;
+                    }
+
+                    if (oldColor == color.Value) continue;
+
+                    LastColors[key] = color.Value;
+
+                    if (!BaselineReady)
+                        continue;
+
+                    if (!changedColor.HasValue)
+                    {
+                        changedColor = color.Value;
+                        changedMember = member;
+                    }
+                    else if (changedColor.Value != color.Value)
+                    {
+                        conflict = true;
+                    }
+                }
+
+                if (!BaselineReady || !changedColor.HasValue)
                     continue;
 
-                LastColors[obj.GetInstanceID()] = color.Value;
-                readable++;
-            }
+                if (conflict)
+                {
+                    Log.LogWarning("MULTIPLE DIFFERENT COLOR CHANGES detected in one network; skipped this scan for safety.");
+                    continue;
+                }
 
+                Log.LogInfo(
+                    "COLOR CHANGE DETECTED: " +
+                    (changedMember == null ? "unknown" : changedMember.GetType().FullName) +
+                    " -> " + changedColor.Value +
+                    " | network=" + network.GetType().FullName +
+                    " | members=" + members.Count);
+
+                PaintWholeNetwork(network, members, changedColor.Value);
+            }
+        }
+
+        if (!BaselineReady && memberCount > 0)
+        {
             BaselineReady = true;
 
             Log.LogInfo(
-                "NETWORK SCAN BASELINE: structures=" + objects.Length +
-                " color-readable=" + readable);
-
-            return;
+                "NETWORK BASELINE READY: networks=" + networkCount +
+                " members=" + memberCount +
+                " color-readable=" + readableCount);
         }
-
-        foreach (UnityEngine.Object obj in objects)
+        else if (!BaselineReady && TickSeen)
         {
-            if (obj == null)
-                continue;
-
-            int? color = ReadColor(obj);
-            if (!color.HasValue)
-                continue;
-
-            int id = obj.GetInstanceID();
-
-            if (!LastColors.TryGetValue(id, out int oldColor))
-            {
-                LastColors[id] = color.Value;
-                continue;
-            }
-
-            if (oldColor == color.Value)
-                continue;
-
-            LastColors[id] = color.Value;
-
             Log.LogInfo(
-                "COLOR CHANGE: " + obj.GetType().FullName +
-                " " + oldColor + " -> " + color.Value);
-
-            Propagate(obj, color.Value);
+                "NETWORK BASELINE WAITING: registries=" + Registries.Count +
+                " networks=" + networkCount +
+                " members=" + memberCount);
         }
     }
 
-    private static int? ReadColor(object obj)
+    private static void PaintWholeNetwork(object network, List<object> members, int color)
     {
-        if (obj == null)
-            return null;
-
-        MethodInfo getter = FindMethod(
-            obj.GetType(),
-            "get_CustomColorIndex",
-            0);
-
-        if (getter != null)
-        {
-            try
-            {
-                object value = getter.Invoke(obj, null);
-                return Convert.ToInt32(value);
-            }
-            catch { }
-        }
-
-        object direct = ReadMember(
-            obj,
-            "CustomColorIndex",
-            "CustomColourIndex",
-            "ColorIndex",
-            "ColourIndex");
-
-        if (direct != null)
-        {
-            try
-            {
-                return Convert.ToInt32(direct);
-            }
-            catch { }
-        }
-
-        return null;
-    }
-
-    private static void Propagate(object source, int color)
-    {
-        object network = GetNetwork(source);
-
-        if (network == null)
-        {
-            Log.LogInfo("NO NETWORK: " + source.GetType().FullName);
-            DumpNetworkMethods(source.GetType());
-            return;
-        }
-
-        IEnumerable members = GetStructureList(network);
-
-        if (members == null)
-        {
-            Log.LogWarning(
-                "NETWORK FOUND BUT NO StructureList: " +
-                network.GetType().FullName);
-
-            DumpNetworkMethods(network.GetType());
-            return;
-        }
-
-        int found = 0;
         int changed = 0;
+        int already = 0;
         int failed = 0;
+        int broadcast = 0;
 
         Propagating = true;
 
@@ -291,29 +375,26 @@ public class NetworkPainterServer : BaseUnityPlugin
         {
             foreach (object member in members)
             {
-                if (member == null)
-                    continue;
-
-                found++;
-
                 int? current = ReadColor(member);
 
-                if (current.HasValue &&
-                    current.Value == color)
+                if (current.HasValue && current.Value == color)
                 {
-                    Remember(member, color);
+                    already++;
+                    LastColors[GetStableKey(member)] = color;
                     continue;
                 }
 
-                if (ApplyColor(member, color))
-                {
-                    changed++;
-                    Remember(member, color);
-                }
-                else
+                if (!ApplyColor(member, color))
                 {
                     failed++;
+                    continue;
                 }
+
+                changed++;
+                LastColors[GetStableKey(member)] = color;
+
+                if (BroadcastThingColor(member, color))
+                    broadcast++;
             }
         }
         finally
@@ -322,106 +403,211 @@ public class NetworkPainterServer : BaseUnityPlugin
         }
 
         Log.LogInfo(
-            "NETWORK PAINT: type=" + network.GetType().FullName +
-            " members=" + found +
+            "NETWORK PAINT COMPLETE: type=" + network.GetType().FullName +
+            " members=" + members.Count +
             " changed=" + changed +
+            " already=" + already +
             " failed=" + failed +
+            " client-updates=" + broadcast +
             " color=" + color);
     }
 
-    private static object GetNetwork(object source)
+    private static IEnumerable GetNetworkMembers(object network)
     {
-        string[] getters =
-        {
-            "get_CableNetwork",
-            "get_PipeNetwork",
-            "get_ChuteNetwork",
-            "get_StructureNetwork"
-        };
-
-        foreach (string name in getters)
-        {
-            MethodInfo m = FindMethod(
-                source.GetType(),
-                name,
-                0);
-
-            if (m == null)
-                continue;
-
-            try
-            {
-                object network = m.Invoke(source, null);
-
-                if (network != null)
-                {
-                    Log.LogInfo(
-                        "NETWORK FOUND: " + name +
-                        " -> " + network.GetType().FullName);
-
-                    return network;
-                }
-            }
-            catch { }
-        }
-
-        return null;
-    }
-
-    private static IEnumerable GetStructureList(object network)
-    {
-        MethodInfo getter = FindMethod(
-            network.GetType(),
-            "get_StructureList",
-            0);
+        MethodInfo getter = FindMethod(network.GetType(), "get_StructureList", 0);
 
         if (getter != null)
         {
             try
             {
                 object value = getter.Invoke(network, null);
-
-                if (value is IEnumerable enumerable)
-                    return enumerable;
+                IEnumerable e = AsEnumerable(value);
+                if (e != null) return e;
             }
             catch { }
         }
 
-        object direct = ReadMember(
-            network,
-            "StructureList");
+        string[] names =
+        {
+            "StructureList",
+            "Structures",
+            "Members",
+            "<StructureList>k__BackingField"
+        };
 
-        return direct as IEnumerable;
+        foreach (string name in names)
+        {
+            object value = ReadMember(network, name);
+            IEnumerable e = AsEnumerable(value);
+            if (e != null) return e;
+        }
+
+        Type t = network.GetType();
+        while (t != null)
+        {
+            FieldInfo[] fields;
+            PropertyInfo[] props;
+
+            try
+            {
+                fields = t.GetFields(
+                    BindingFlags.Instance | BindingFlags.Public |
+                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            catch
+            {
+                fields = new FieldInfo[0];
+            }
+
+            foreach (FieldInfo f in fields)
+            {
+                if (f.Name.IndexOf("Structure", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    f.Name.IndexOf("Member", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                try
+                {
+                    IEnumerable e = AsEnumerable(f.GetValue(network));
+                    if (e != null) return e;
+                }
+                catch { }
+            }
+
+            try
+            {
+                props = t.GetProperties(
+                    BindingFlags.Instance | BindingFlags.Public |
+                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            }
+            catch
+            {
+                props = new PropertyInfo[0];
+            }
+
+            foreach (PropertyInfo p in props)
+            {
+                if (p.GetIndexParameters().Length != 0) continue;
+
+                if (p.Name.IndexOf("Structure", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    p.Name.IndexOf("Member", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                try
+                {
+                    IEnumerable e = AsEnumerable(p.GetValue(network, null));
+                    if (e != null) return e;
+                }
+                catch { }
+            }
+
+            t = t.BaseType;
+        }
+
+        Log.LogWarning("Could not find member list on network type " + network.GetType().FullName);
+        return null;
+    }
+
+    private static IEnumerable AsEnumerable(object value)
+    {
+        if (value == null || value is string) return null;
+
+        IDictionary dict = value as IDictionary;
+        if (dict != null) return dict.Values;
+
+        IEnumerable enumerable = value as IEnumerable;
+        if (enumerable != null) return enumerable;
+
+        object values = ReadMember(value, "Values");
+        if (values != null && !ReferenceEquals(values, value))
+            return values as IEnumerable;
+
+        return null;
+    }
+
+    private static IEnumerable<object> EnumerateCollection(object collection)
+    {
+        IDictionary dict = collection as IDictionary;
+
+        if (dict != null)
+        {
+            foreach (object value in dict.Values)
+                yield return value;
+
+            yield break;
+        }
+
+        IEnumerable enumerable = collection as IEnumerable;
+
+        if (enumerable != null)
+        {
+            foreach (object value in enumerable)
+                yield return value;
+
+            yield break;
+        }
+
+        object values = ReadMember(collection, "Values");
+        IEnumerable valuesEnumerable = values as IEnumerable;
+
+        if (valuesEnumerable != null)
+        {
+            foreach (object value in valuesEnumerable)
+                yield return value;
+        }
+    }
+
+    private static int? ReadColor(object obj)
+    {
+        if (obj == null) return null;
+
+        MethodInfo getter = FindMethod(obj.GetType(), "get_CustomColorIndex", 0);
+
+        if (getter != null)
+        {
+            try
+            {
+                return Convert.ToInt32(getter.Invoke(obj, null));
+            }
+            catch { }
+        }
+
+        string[] names =
+        {
+            "CustomColorIndex",
+            "<CustomColorIndex>k__BackingField",
+            "CustomColourIndex",
+            "ColorIndex",
+            "ColourIndex"
+        };
+
+        foreach (string name in names)
+        {
+            object value = ReadMember(obj, name);
+
+            if (value == null) continue;
+
+            try { return Convert.ToInt32(value); }
+            catch { }
+        }
+
+        return null;
     }
 
     private static bool ApplyColor(object target, int color)
     {
-        foreach (MethodInfo m in FindMethods(
-            target.GetType(),
-            "SetCustomColor"))
+        foreach (MethodInfo m in FindMethods(target.GetType(), "SetCustomColor"))
         {
             ParameterInfo[] p;
 
-            try
-            {
-                p = m.GetParameters();
-            }
-            catch
-            {
-                continue;
-            }
+            try { p = m.GetParameters(); }
+            catch { continue; }
 
-            if (p.Length < 1 || p.Length > 3)
-                continue;
+            if (p.Length < 1 || p.Length > 3) continue;
 
             try
             {
                 object[] args = new object[p.Length];
-
-                args[0] =
-                    ConvertValue(
-                        color,
-                        p[0].ParameterType);
+                args[0] = ConvertValue(color, p[0].ParameterType);
 
                 for (int i = 1; i < p.Length; i++)
                 {
@@ -430,8 +616,7 @@ public class NetworkPainterServer : BaseUnityPlugin
                     else if (p[i].HasDefaultValue)
                         args[i] = p[i].DefaultValue;
                     else if (p[i].ParameterType.IsValueType)
-                        args[i] = Activator.CreateInstance(
-                            p[i].ParameterType);
+                        args[i] = Activator.CreateInstance(p[i].ParameterType);
                     else
                         args[i] = null;
                 }
@@ -442,51 +627,106 @@ public class NetworkPainterServer : BaseUnityPlugin
             catch { }
         }
 
-        MethodInfo setter = FindMethod(
-            target.GetType(),
-            "set_CustomColorIndex",
-            1);
+        MethodInfo setter = FindMethod(target.GetType(), "set_CustomColorIndex", 1);
 
         if (setter != null)
         {
             try
             {
-                Type t =
-                    setter.GetParameters()[0]
-                    .ParameterType;
-
-                setter.Invoke(
-                    target,
-                    new object[]
-                    {
-                        ConvertValue(color, t)
-                    });
-
+                Type type = setter.GetParameters()[0].ParameterType;
+                setter.Invoke(target, new object[] { ConvertValue(color, type) });
                 return true;
             }
             catch { }
         }
 
-        return false;
+        return WriteMember(target, "CustomColorIndex", color) ||
+               WriteMember(target, "<CustomColorIndex>k__BackingField", color);
     }
 
-    private static void Remember(object obj, int color)
+    private static bool BroadcastThingColor(object thing, int color)
     {
-        UnityEngine.Object unityObj =
-            obj as UnityEngine.Object;
+        if (ThingColorMessageType == null || thing == null) return false;
 
-        if (unityObj == null)
-            return;
+        object reference = ReadMember(
+            thing,
+            "ReferenceId",
+            "ReferenceID",
+            "<ReferenceId>k__BackingField",
+            "ThingId");
 
-        LastColors[unityObj.GetInstanceID()] = color;
+        if (reference == null) return false;
+
+        object message = null;
+
+        try
+        {
+            message = Activator.CreateInstance(ThingColorMessageType, true);
+        }
+        catch { }
+
+        if (message == null)
+        {
+            MethodInfo singleton = FindMethod(ThingColorMessageType, "get_Singleton", 0);
+
+            if (singleton != null)
+            {
+                try
+                {
+                    message = singleton.Invoke(singleton.IsStatic ? null : message, null);
+                }
+                catch { }
+            }
+        }
+
+        if (message == null) return false;
+
+        if (!WriteMember(message, "ThingId", reference)) return false;
+        if (!WriteMember(message, "ColorIndex", color)) return false;
+
+        MethodInfo send = FindMethod(message.GetType(), "SendToClients", 0);
+        if (send == null) return false;
+
+        try
+        {
+            send.Invoke(message, null);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
-    private static object ReadMember(
-        object obj,
-        params string[] names)
+    private static long GetStableKey(object obj)
     {
-        if (obj == null)
-            return null;
+        object reference = ReadMember(
+            obj,
+            "ReferenceId",
+            "ReferenceID",
+            "<ReferenceId>k__BackingField");
+
+        if (reference != null)
+        {
+            try
+            {
+                long id = Convert.ToInt64(reference);
+                if (id != 0) return id;
+            }
+            catch { }
+        }
+
+        UnityEngine.Object unityObject = obj as UnityEngine.Object;
+
+        if (unityObject != null)
+            return long.MinValue + (long)unityObject.GetInstanceID();
+
+        return long.MinValue / 2 + RuntimeHelpers.GetHashCode(obj);
+    }
+
+    private static object ReadMember(object obj, params string[] names)
+    {
+        if (obj == null) return null;
 
         Type start = obj.GetType();
 
@@ -498,32 +738,32 @@ public class NetworkPainterServer : BaseUnityPlugin
             {
                 try
                 {
-                    FieldInfo f =
-                        t.GetField(
-                            name,
-                            BindingFlags.Instance |
-                            BindingFlags.Public |
-                            BindingFlags.NonPublic |
-                            BindingFlags.DeclaredOnly);
+                    FieldInfo f = t.GetField(
+                        name,
+                        BindingFlags.Instance | BindingFlags.Static |
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly);
 
                     if (f != null)
-                        return f.GetValue(obj);
+                        return f.GetValue(f.IsStatic ? null : obj);
                 }
                 catch { }
 
                 try
                 {
-                    PropertyInfo p =
-                        t.GetProperty(
-                            name,
-                            BindingFlags.Instance |
-                            BindingFlags.Public |
-                            BindingFlags.NonPublic |
-                            BindingFlags.DeclaredOnly);
+                    PropertyInfo p = t.GetProperty(
+                        name,
+                        BindingFlags.Instance | BindingFlags.Static |
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly);
 
-                    if (p != null &&
-                        p.GetIndexParameters().Length == 0)
-                        return p.GetValue(obj, null);
+                    if (p != null && p.GetIndexParameters().Length == 0)
+                    {
+                        MethodInfo getter = p.GetGetMethod(true);
+
+                        if (getter != null)
+                            return p.GetValue(getter.IsStatic ? null : obj, null);
+                    }
                 }
                 catch { }
 
@@ -534,21 +774,107 @@ public class NetworkPainterServer : BaseUnityPlugin
         return null;
     }
 
-    private static MethodInfo FindMethod(
-        Type type,
-        string name,
-        int argCount)
+    private static bool WriteMember(object obj, string name, object value)
+    {
+        if (obj == null) return false;
+
+        Type t = obj.GetType();
+
+        while (t != null)
+        {
+            try
+            {
+                FieldInfo f = t.GetField(
+                    name,
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+
+                if (f != null)
+                {
+                    f.SetValue(f.IsStatic ? null : obj, ConvertObject(value, f.FieldType));
+                    return true;
+                }
+            }
+            catch { }
+
+            try
+            {
+                PropertyInfo p = t.GetProperty(
+                    name,
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+
+                if (p != null && p.CanWrite)
+                {
+                    MethodInfo setter = p.GetSetMethod(true);
+
+                    if (setter != null)
+                    {
+                        p.SetValue(setter.IsStatic ? null : obj, ConvertObject(value, p.PropertyType), null);
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            t = t.BaseType;
+        }
+
+        return false;
+    }
+
+    private static MethodInfo FindDeclaredMethod(Type t, string name)
+    {
+        if (t == null) return null;
+
+        MethodInfo[] methods;
+
+        try
+        {
+            methods = t.GetMethods(
+                BindingFlags.Instance | BindingFlags.Static |
+                BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly);
+        }
+        catch
+        {
+            return null;
+        }
+
+        foreach (MethodInfo m in methods)
+            if (m.Name == name)
+                return m;
+
+        return null;
+    }
+
+    private static MethodInfo FindMethod(Type type, string name, int argCount)
     {
         Type t = type;
 
         while (t != null)
         {
-            foreach (MethodInfo m in SafeMethods(t))
+            MethodInfo[] methods;
+
+            try
+            {
+                methods = t.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+            }
+            catch
+            {
+                methods = new MethodInfo[0];
+            }
+
+            foreach (MethodInfo m in methods)
             {
                 try
                 {
-                    if (m.Name == name &&
-                        m.GetParameters().Length == argCount)
+                    if (m.Name == name && m.GetParameters().Length == argCount)
                         return m;
                 }
                 catch { }
@@ -560,15 +886,27 @@ public class NetworkPainterServer : BaseUnityPlugin
         return null;
     }
 
-    private static IEnumerable<MethodInfo> FindMethods(
-        Type type,
-        string name)
+    private static IEnumerable<MethodInfo> FindMethods(Type type, string name)
     {
         Type t = type;
 
         while (t != null)
         {
-            foreach (MethodInfo m in SafeMethods(t))
+            MethodInfo[] methods;
+
+            try
+            {
+                methods = t.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly);
+            }
+            catch
+            {
+                methods = new MethodInfo[0];
+            }
+
+            foreach (MethodInfo m in methods)
                 if (m.Name == name)
                     yield return m;
 
@@ -576,37 +914,51 @@ public class NetworkPainterServer : BaseUnityPlugin
         }
     }
 
-    private static object ConvertValue(
-        int color,
-        Type target)
+    private static object ConvertValue(int value, Type target)
     {
-        if (target.IsByRef)
-            target = target.GetElementType();
+        if (target.IsByRef) target = target.GetElementType();
 
-        if (target == typeof(int))
-            return color;
+        if (target == typeof(int)) return value;
+        if (target.IsEnum) return Enum.ToObject(target, value);
 
-        if (target.IsEnum)
-            return Enum.ToObject(target, color);
-
-        return Convert.ChangeType(color, target);
+        return Convert.ChangeType(value, target);
     }
 
-    private static IEnumerable<Type> SafeTypes(Assembly a)
+    private static object ConvertObject(object value, Type target)
+    {
+        if (target.IsByRef) target = target.GetElementType();
+
+        if (value == null)
+            return target.IsValueType ? Activator.CreateInstance(target) : null;
+
+        Type source = value.GetType();
+
+        if (target.IsAssignableFrom(source))
+            return value;
+
+        if (target.IsEnum)
+            return Enum.ToObject(target, Convert.ToInt32(value));
+
+        if (source.IsEnum)
+            return Convert.ChangeType(Convert.ToInt32(value), target);
+
+        return Convert.ChangeType(value, target);
+    }
+
+    private static IEnumerable<Type> SafeTypes(Assembly assembly)
     {
         try
         {
-            return a.GetTypes();
+            return assembly.GetTypes();
         }
         catch (ReflectionTypeLoadException e)
         {
-            List<Type> types = new List<Type>();
+            List<Type> result = new List<Type>();
 
             foreach (Type t in e.Types)
-                if (t != null)
-                    types.Add(t);
+                if (t != null) result.Add(t);
 
-            return types;
+            return result;
         }
         catch
         {
@@ -614,59 +966,71 @@ public class NetworkPainterServer : BaseUnityPlugin
         }
     }
 
-    private static MethodInfo[] SafeMethods(Type t)
+    internal sealed class RegistryAccessor
     {
-        try
+        internal readonly Type OwnerType;
+        internal readonly string Name;
+        private readonly FieldInfo field;
+        private readonly PropertyInfo property;
+
+        internal RegistryAccessor(Type ownerType, string name, FieldInfo fieldInfo, PropertyInfo propertyInfo)
         {
-            return t.GetMethods(
-                BindingFlags.Instance |
-                BindingFlags.Static |
-                BindingFlags.Public |
-                BindingFlags.NonPublic |
-                BindingFlags.DeclaredOnly);
+            OwnerType = ownerType;
+            Name = name;
+            field = fieldInfo;
+            property = propertyInfo;
         }
-        catch
+
+        internal object GetValue()
         {
-            return new MethodInfo[0];
-        }
-    }
-
-    private static void DumpNetworkMethods(Type type)
-    {
-        Log.LogInfo(
-            "Network-related methods on " +
-            type.FullName + ":");
-
-        Type t = type;
-
-        while (t != null)
-        {
-            foreach (MethodInfo m in SafeMethods(t))
+            try
             {
-                string n = m.Name;
-
-                if (n.IndexOf(
-                        "Network",
-                        StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf(
-                        "Cable",
-                        StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf(
-                        "Pipe",
-                        StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf(
-                        "Chute",
-                        StringComparison.OrdinalIgnoreCase) >= 0)
+                if (field != null)
                 {
-                    Log.LogInfo(
-                        "  " +
-                        t.FullName +
-                        "." +
-                        n);
+                    object owner = field.IsStatic ? null : FindOwner();
+                    if (!field.IsStatic && owner == null) return null;
+                    return field.GetValue(owner);
+                }
+
+                if (property != null)
+                {
+                    MethodInfo getter = property.GetGetMethod(true);
+                    if (getter == null) return null;
+
+                    object owner = getter.IsStatic ? null : FindOwner();
+                    if (!getter.IsStatic && owner == null) return null;
+
+                    return property.GetValue(owner, null);
                 }
             }
+            catch { }
 
-            t = t.BaseType;
+            return null;
+        }
+
+        private object FindOwner()
+        {
+            try
+            {
+                MethodInfo getInstance = FindMethod(OwnerType, "get_Instance", 0);
+
+                if (getInstance != null && getInstance.IsStatic)
+                {
+                    object instance = getInstance.Invoke(null, null);
+                    if (instance != null) return instance;
+                }
+            }
+            catch { }
+
+            try
+            {
+                UnityEngine.Object[] objects = UnityEngine.Object.FindObjectsOfType(OwnerType);
+                if (objects != null && objects.Length > 0)
+                    return objects[0];
+            }
+            catch { }
+
+            return null;
         }
     }
 }
