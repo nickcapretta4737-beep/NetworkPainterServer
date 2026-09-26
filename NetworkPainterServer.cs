@@ -1,110 +1,157 @@
 using BepInEx;
 using BepInEx.Logging;
+using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Threading;
 using UnityEngine;
 
-[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "9.0.0")]
+[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "10.0.0")]
 public class NetworkPainterServer : BaseUnityPlugin
 {
-    private static ManualLogSource Log;
-    private static Type StructureType;
-    private readonly Dictionary<int, int> lastColors = new Dictionary<int, int>();
-    private bool baselineReady;
-    private bool propagating;
-    private bool scanQueued;
-    private SynchronizationContext unityContext;
-    private System.Threading.Timer scanTimer;
+    internal static ManualLogSource Log;
+    internal static Type StructureType;
+    internal static readonly Dictionary<int, int> LastColors = new Dictionary<int, int>();
+    internal static bool BaselineReady;
+    internal static bool Propagating;
+    internal static long NextScanMs;
+    internal static bool FirstTickLogged;
+    private Harmony harmony;
 
     private void Awake()
     {
         Log = Logger;
-        Log.LogInfo("Network Painter Server 9.0.0 starting");
+        Log.LogInfo("Network Painter Server 10.0.0 starting");
 
-        unityContext = SynchronizationContext.Current;
-        if (unityContext == null)
-        {
-            Log.LogError("Unity SynchronizationContext was not available.");
-            return;
-        }
-
+        Assembly game = null;
         foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
         {
             try
             {
-                StructureType = a.GetType("Assets.Scripts.Objects.Structure", false);
-                if (StructureType != null) break;
+                Type s = a.GetType("Assets.Scripts.Objects.Structure", false);
+                if (s != null)
+                {
+                    StructureType = s;
+                    game = a;
+                    break;
+                }
             }
             catch { }
         }
 
-        if (StructureType == null)
+        if (StructureType == null || game == null)
         {
             Log.LogError("Could not find Assets.Scripts.Objects.Structure");
             return;
         }
 
         Log.LogInfo("Structure type found: " + StructureType.FullName);
-        Log.LogInfo("Main-thread timer scan enabled. Interval: 0.25 seconds.");
 
-        scanTimer = new System.Threading.Timer(
-            QueueScan,
-            null,
-            1000,
-            250);
+        harmony = new Harmony("dominic.networkpainterserver.v10");
+
+        string[] tickNames =
+        {
+            "OnMainTick",
+            "ServerTick",
+            "AllTick",
+            "OnLifeTick",
+            "ThingUpdate",
+            "SlowUpdate"
+        };
+
+        int patched = 0;
+
+        foreach (Type t in SafeTypes(game))
+        {
+            foreach (MethodInfo m in SafeMethods(t))
+            {
+                bool wanted = false;
+
+                foreach (string name in tickNames)
+                {
+                    if (m.Name == name)
+                    {
+                        wanted = true;
+                        break;
+                    }
+                }
+
+                if (!wanted || m.IsAbstract || m.ContainsGenericParameters)
+                    continue;
+
+                if (m.DeclaringType != null &&
+                    m.DeclaringType.Name.StartsWith("<"))
+                    continue;
+
+                try
+                {
+                    harmony.Patch(
+                        m,
+                        postfix: new HarmonyMethod(
+                            typeof(NetworkPainterServer),
+                            nameof(TickPostfix)));
+
+                    patched++;
+                    Log.LogInfo("Patched tick hook: " +
+                        m.DeclaringType.FullName + "." + m.Name);
+                }
+                catch (Exception e)
+                {
+                    Log.LogWarning("Could not patch tick hook " +
+                        m.DeclaringType.FullName + "." + m.Name +
+                        ": " + e.Message);
+                }
+            }
+        }
+
+        Log.LogInfo("Network Painter Server ready. Tick hooks patched=" + patched);
     }
 
     private void OnDestroy()
     {
         try
         {
-            if (scanTimer != null)
-            {
-                scanTimer.Dispose();
-                scanTimer = null;
-            }
+            if (harmony != null)
+                harmony.UnpatchSelf();
         }
         catch { }
     }
 
-    private void QueueScan(object state)
+    public static void TickPostfix(MethodBase __originalMethod)
     {
-        if (StructureType == null || propagating || scanQueued) return;
+        if (Propagating || StructureType == null)
+            return;
 
-        scanQueued = true;
+        long now = Environment.TickCount64;
+
+        if (!FirstTickLogged)
+        {
+            FirstTickLogged = true;
+            Log.LogInfo("TICK HOOK ACTIVE: " +
+                (__originalMethod.DeclaringType != null
+                    ? __originalMethod.DeclaringType.FullName
+                    : "?") +
+                "." + __originalMethod.Name);
+        }
+
+        if (now < NextScanMs)
+            return;
+
+        NextScanMs = now + 250;
 
         try
         {
-            unityContext.Post(_ =>
-            {
-                try
-                {
-                    Scan();
-                }
-                catch (Exception e)
-                {
-                    Log.LogError("Main-thread scan exception: " + e);
-                }
-                finally
-                {
-                    scanQueued = false;
-                }
-            }, null);
+            Scan();
         }
         catch (Exception e)
         {
-            scanQueued = false;
-            Log.LogError("Could not queue network scan: " + e.Message);
+            Log.LogError("Network scan exception: " + e);
         }
     }
 
-    private void Scan()
+    private static void Scan()
     {
-        if (propagating) return;
-
         UnityEngine.Object[] objects;
 
         try
@@ -119,20 +166,21 @@ public class NetworkPainterServer : BaseUnityPlugin
 
         int readable = 0;
 
-        if (!baselineReady)
+        if (!BaselineReady)
         {
-            lastColors.Clear();
+            LastColors.Clear();
 
             foreach (UnityEngine.Object obj in objects)
             {
                 int? color = ReadColor(obj);
-                if (!color.HasValue) continue;
+                if (!color.HasValue)
+                    continue;
 
-                lastColors[obj.GetInstanceID()] = color.Value;
+                LastColors[obj.GetInstanceID()] = color.Value;
                 readable++;
             }
 
-            baselineReady = true;
+            BaselineReady = true;
 
             Log.LogInfo(
                 "NETWORK SCAN BASELINE: structures=" + objects.Length +
@@ -141,27 +189,27 @@ public class NetworkPainterServer : BaseUnityPlugin
             return;
         }
 
-        HashSet<int> alive = new HashSet<int>();
-
         foreach (UnityEngine.Object obj in objects)
         {
-            if (obj == null) continue;
-
-            int id = obj.GetInstanceID();
-            alive.Add(id);
+            if (obj == null)
+                continue;
 
             int? color = ReadColor(obj);
-            if (!color.HasValue) continue;
+            if (!color.HasValue)
+                continue;
 
-            if (!lastColors.TryGetValue(id, out int oldColor))
+            int id = obj.GetInstanceID();
+
+            if (!LastColors.TryGetValue(id, out int oldColor))
             {
-                lastColors[id] = color.Value;
+                LastColors[id] = color.Value;
                 continue;
             }
 
-            if (oldColor == color.Value) continue;
+            if (oldColor == color.Value)
+                continue;
 
-            lastColors[id] = color.Value;
+            LastColors[id] = color.Value;
 
             Log.LogInfo(
                 "COLOR CHANGE: " + obj.GetType().FullName +
@@ -169,23 +217,12 @@ public class NetworkPainterServer : BaseUnityPlugin
 
             Propagate(obj, color.Value);
         }
-
-        if (lastColors.Count > alive.Count + 100)
-        {
-            List<int> dead = new List<int>();
-
-            foreach (int id in lastColors.Keys)
-                if (!alive.Contains(id))
-                    dead.Add(id);
-
-            foreach (int id in dead)
-                lastColors.Remove(id);
-        }
     }
 
-    private int? ReadColor(object obj)
+    private static int? ReadColor(object obj)
     {
-        if (obj == null) return null;
+        if (obj == null)
+            return null;
 
         MethodInfo getter = FindMethod(
             obj.GetType(),
@@ -196,8 +233,8 @@ public class NetworkPainterServer : BaseUnityPlugin
         {
             try
             {
-                object v = getter.Invoke(obj, null);
-                return Convert.ToInt32(v);
+                object value = getter.Invoke(obj, null);
+                return Convert.ToInt32(value);
             }
             catch { }
         }
@@ -221,16 +258,13 @@ public class NetworkPainterServer : BaseUnityPlugin
         return null;
     }
 
-    private void Propagate(object source, int color)
+    private static void Propagate(object source, int color)
     {
-        object network = GetBestNetwork(source);
+        object network = GetNetwork(source);
 
         if (network == null)
         {
-            Log.LogInfo(
-                "NO NETWORK: " +
-                source.GetType().FullName);
-
+            Log.LogInfo("NO NETWORK: " + source.GetType().FullName);
             DumpNetworkMethods(source.GetType());
             return;
         }
@@ -251,13 +285,14 @@ public class NetworkPainterServer : BaseUnityPlugin
         int changed = 0;
         int failed = 0;
 
-        propagating = true;
+        Propagating = true;
 
         try
         {
             foreach (object member in members)
             {
-                if (member == null) continue;
+                if (member == null)
+                    continue;
 
                 found++;
 
@@ -266,14 +301,14 @@ public class NetworkPainterServer : BaseUnityPlugin
                 if (current.HasValue &&
                     current.Value == color)
                 {
-                    RememberColor(member, color);
+                    Remember(member, color);
                     continue;
                 }
 
                 if (ApplyColor(member, color))
                 {
                     changed++;
-                    RememberColor(member, color);
+                    Remember(member, color);
                 }
                 else
                 {
@@ -283,19 +318,18 @@ public class NetworkPainterServer : BaseUnityPlugin
         }
         finally
         {
-            propagating = false;
+            Propagating = false;
         }
 
         Log.LogInfo(
-            "NETWORK PAINT: type=" +
-            network.GetType().FullName +
+            "NETWORK PAINT: type=" + network.GetType().FullName +
             " members=" + found +
             " changed=" + changed +
             " failed=" + failed +
             " color=" + color);
     }
 
-    private object GetBestNetwork(object source)
+    private static object GetNetwork(object source)
     {
         string[] getters =
         {
@@ -312,37 +346,29 @@ public class NetworkPainterServer : BaseUnityPlugin
                 name,
                 0);
 
-            if (m == null) continue;
+            if (m == null)
+                continue;
 
             try
             {
-                object network = m.Invoke(
-                    source,
-                    null);
+                object network = m.Invoke(source, null);
 
                 if (network != null)
                 {
                     Log.LogInfo(
-                        "NETWORK FOUND: " +
-                        name + " -> " +
-                        network.GetType().FullName);
+                        "NETWORK FOUND: " + name +
+                        " -> " + network.GetType().FullName);
 
                     return network;
                 }
             }
-            catch (Exception e)
-            {
-                Log.LogWarning(
-                    name + " failed on " +
-                    source.GetType().FullName +
-                    ": " + e.Message);
-            }
+            catch { }
         }
 
         return null;
     }
 
-    private IEnumerable GetStructureList(object network)
+    private static IEnumerable GetStructureList(object network)
     {
         MethodInfo getter = FindMethod(
             network.GetType(),
@@ -353,11 +379,9 @@ public class NetworkPainterServer : BaseUnityPlugin
         {
             try
             {
-                object v = getter.Invoke(
-                    network,
-                    null);
+                object value = getter.Invoke(network, null);
 
-                if (v is IEnumerable enumerable)
+                if (value is IEnumerable enumerable)
                     return enumerable;
             }
             catch { }
@@ -370,7 +394,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         return direct as IEnumerable;
     }
 
-    private bool ApplyColor(object target, int color)
+    private static bool ApplyColor(object target, int color)
     {
         foreach (MethodInfo m in FindMethods(
             target.GetType(),
@@ -392,8 +416,7 @@ public class NetworkPainterServer : BaseUnityPlugin
 
             try
             {
-                object[] args =
-                    new object[p.Length];
+                object[] args = new object[p.Length];
 
                 args[0] =
                     ConvertValue(
@@ -447,9 +470,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         return false;
     }
 
-    private void RememberColor(
-        object obj,
-        int color)
+    private static void Remember(object obj, int color)
     {
         UnityEngine.Object unityObj =
             obj as UnityEngine.Object;
@@ -457,11 +478,10 @@ public class NetworkPainterServer : BaseUnityPlugin
         if (unityObj == null)
             return;
 
-        lastColors[
-            unityObj.GetInstanceID()] = color;
+        LastColors[unityObj.GetInstanceID()] = color;
     }
 
-    private object ReadMember(
+    private static object ReadMember(
         object obj,
         params string[] names)
     {
@@ -502,11 +522,8 @@ public class NetworkPainterServer : BaseUnityPlugin
                             BindingFlags.DeclaredOnly);
 
                     if (p != null &&
-                        p.GetIndexParameters()
-                        .Length == 0)
-                        return p.GetValue(
-                            obj,
-                            null);
+                        p.GetIndexParameters().Length == 0)
+                        return p.GetValue(obj, null);
                 }
                 catch { }
 
@@ -517,7 +534,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         return null;
     }
 
-    private MethodInfo FindMethod(
+    private static MethodInfo FindMethod(
         Type type,
         string name,
         int argCount)
@@ -526,31 +543,12 @@ public class NetworkPainterServer : BaseUnityPlugin
 
         while (t != null)
         {
-            MethodInfo[] methods;
-
-            try
-            {
-                methods =
-                    t.GetMethods(
-                        BindingFlags.Instance |
-                        BindingFlags.Static |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic |
-                        BindingFlags.DeclaredOnly);
-            }
-            catch
-            {
-                methods =
-                    new MethodInfo[0];
-            }
-
-            foreach (MethodInfo m in methods)
+            foreach (MethodInfo m in SafeMethods(t))
             {
                 try
                 {
                     if (m.Name == name &&
-                        m.GetParameters()
-                        .Length == argCount)
+                        m.GetParameters().Length == argCount)
                         return m;
                 }
                 catch { }
@@ -562,7 +560,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         return null;
     }
 
-    private IEnumerable<MethodInfo> FindMethods(
+    private static IEnumerable<MethodInfo> FindMethods(
         Type type,
         string name)
     {
@@ -570,25 +568,7 @@ public class NetworkPainterServer : BaseUnityPlugin
 
         while (t != null)
         {
-            MethodInfo[] methods;
-
-            try
-            {
-                methods =
-                    t.GetMethods(
-                        BindingFlags.Instance |
-                        BindingFlags.Static |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic |
-                        BindingFlags.DeclaredOnly);
-            }
-            catch
-            {
-                methods =
-                    new MethodInfo[0];
-            }
-
-            foreach (MethodInfo m in methods)
+            foreach (MethodInfo m in SafeMethods(t))
                 if (m.Name == name)
                     yield return m;
 
@@ -596,7 +576,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         }
     }
 
-    private object ConvertValue(
+    private static object ConvertValue(
         int color,
         Type target)
     {
@@ -607,17 +587,51 @@ public class NetworkPainterServer : BaseUnityPlugin
             return color;
 
         if (target.IsEnum)
-            return Enum.ToObject(
-                target,
-                color);
+            return Enum.ToObject(target, color);
 
-        return Convert.ChangeType(
-            color,
-            target);
+        return Convert.ChangeType(color, target);
     }
 
-    private void DumpNetworkMethods(
-        Type type)
+    private static IEnumerable<Type> SafeTypes(Assembly a)
+    {
+        try
+        {
+            return a.GetTypes();
+        }
+        catch (ReflectionTypeLoadException e)
+        {
+            List<Type> types = new List<Type>();
+
+            foreach (Type t in e.Types)
+                if (t != null)
+                    types.Add(t);
+
+            return types;
+        }
+        catch
+        {
+            return new Type[0];
+        }
+    }
+
+    private static MethodInfo[] SafeMethods(Type t)
+    {
+        try
+        {
+            return t.GetMethods(
+                BindingFlags.Instance |
+                BindingFlags.Static |
+                BindingFlags.Public |
+                BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly);
+        }
+        catch
+        {
+            return new MethodInfo[0];
+        }
+    }
+
+    private static void DumpNetworkMethods(Type type)
     {
         Log.LogInfo(
             "Network-related methods on " +
@@ -627,32 +641,11 @@ public class NetworkPainterServer : BaseUnityPlugin
 
         while (t != null)
         {
-            MethodInfo[] methods;
-
-            try
-            {
-                methods =
-                    t.GetMethods(
-                        BindingFlags.Instance |
-                        BindingFlags.Static |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic |
-                        BindingFlags.DeclaredOnly);
-            }
-            catch
-            {
-                methods =
-                    new MethodInfo[0];
-            }
-
-            foreach (MethodInfo m in methods)
+            foreach (MethodInfo m in SafeMethods(t))
             {
                 string n = m.Name;
 
                 if (n.IndexOf(
-                        "Structure",
-                        StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf(
                         "Network",
                         StringComparison.OrdinalIgnoreCase) >= 0 ||
                     n.IndexOf(
