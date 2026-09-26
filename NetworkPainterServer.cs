@@ -123,7 +123,7 @@ public class NetworkPainterServer : BaseUnityPlugin
         if (Propagating || StructureType == null)
             return;
 
-        long now = Environment.TickCount64;
+        long now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
 
         if (!FirstTickLogged)
         {
