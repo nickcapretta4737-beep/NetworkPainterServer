@@ -1,318 +1,186 @@
 using BepInEx;
+using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 using UnityEngine;
 
-namespace NetworkPainterServer
+[BepInPlugin("dominic.networkpainterserver", "Network Painter Server", "3.0.0")]
+public class NetworkPainterServer : BaseUnityPlugin
 {
-    [BepInPlugin("net.dominic.stationeers.networkpainter.server", "Network Painter Server", "2.0.0")]
-    public sealed class NetworkPainterServerPlugin : BaseUnityPlugin
+    private static ManualLogSource Log;
+    private readonly Dictionary<int, int> lastColors = new Dictionary<int, int>();
+    private float nextScan;
+    private bool baselineReady;
+    private Type structureType;
+    private PropertyInfo customColorProp;
+    private PropertyInfo cableNetworkProp;
+    private PropertyInfo pipeNetworkProp;
+    private PropertyInfo chuteNetworkProp;
+
+    private void Awake()
     {
-        internal static NetworkPainterServerPlugin Instance;
-        private Harmony _harmony;
-        private Type _structureType;
-        private readonly Queue<object> _pending = new Queue<object>();
-        private readonly HashSet<int> _queued = new HashSet<int>();
-        private bool _propagating;
-        private float _nextProcess;
-
-        private static readonly string[] NetworkNames = { "CableNetwork", "PipeNetwork", "ChuteNetwork" };
-
-        private void Awake()
+        Log = Logger;
+        Log.LogInfo("Network Painter Server 3.0.0 starting");
+        structureType = AccessTools.TypeByName("Assets.Scripts.Objects.Structure");
+        if (structureType == null)
         {
-            Instance = this;
-            Logger.LogInfo("Network Painter Server 2.0.0 starting");
-            _structureType = FindType("Assets.Scripts.Objects.Structure") ?? FindTypeByName("Structure");
-            if (_structureType == null)
+            Log.LogError("Could not find Assets.Scripts.Objects.Structure");
+            return;
+        }
+        customColorProp = AccessTools.Property(structureType, "CustomColorIndex") ?? AccessTools.Property(structureType.BaseType, "CustomColorIndex");
+        cableNetworkProp = AccessTools.Property(structureType, "CableNetwork") ?? AccessTools.Property(structureType.BaseType, "CableNetwork");
+        pipeNetworkProp = AccessTools.Property(structureType, "PipeNetwork") ?? AccessTools.Property(structureType.BaseType, "PipeNetwork");
+        chuteNetworkProp = AccessTools.Property(structureType, "ChuteNetwork") ?? AccessTools.Property(structureType.BaseType, "ChuteNetwork");
+        Log.LogInfo("Structure type: " + structureType.FullName);
+        Log.LogInfo("Network Painter Server ready. Watching server-side color state...");
+    }
+
+    private void Update()
+    {
+        if (Time.realtimeSinceStartup < nextScan) return;
+        nextScan = Time.realtimeSinceStartup + 0.25f;
+        ScanStructures();
+    }
+
+    private void ScanStructures()
+    {
+        if (structureType == null || customColorProp == null) return;
+        UnityEngine.Object[] objs;
+        try { objs = UnityEngine.Object.FindObjectsOfType(structureType); }
+        catch (Exception e)
+        {
+            Log.LogError("FindObjectsOfType failed: " + e.Message);
+            return;
+        }
+        if (!baselineReady)
+        {
+            lastColors.Clear();
+            foreach (var o in objs) lastColors[o.GetInstanceID()] = ReadColor(o);
+            baselineReady = true;
+            Log.LogInfo("Color baseline ready. Tracking " + lastColors.Count + " structures.");
+            return;
+        }
+        foreach (var o in objs)
+        {
+            int id = o.GetInstanceID();
+            int color = ReadColor(o);
+            if (!lastColors.TryGetValue(id, out int oldColor))
             {
-                Logger.LogError("Could not find Stationeers Structure type; plugin disabled.");
-                enabled = false;
-                return;
+                lastColors[id] = color;
+                continue;
             }
+            if (color == oldColor) continue;
+            lastColors[id] = color;
+            Log.LogInfo("Detected painted network piece: " + o.name + " color " + oldColor + " -> " + color);
+            PropagateNetworkColor(o, color);
+        }
+    }
 
-            _harmony = new Harmony("net.dominic.stationeers.networkpainter.server");
-            int patched = PatchColorMethods();
-            if (patched == 0)
+    private int ReadColor(object obj)
+    {
+        try { return Convert.ToInt32(customColorProp.GetValue(obj, null)); }
+        catch { return -999; }
+    }
+
+    private void PropagateNetworkColor(object source, int color)
+    {
+        object network = GetNetwork(source);
+        if (network == null)
+        {
+            Log.LogInfo("Painted piece has no cable/pipe/chute network.");
+            return;
+        }
+        IEnumerable members = GetMembers(network);
+        if (members == null)
+        {
+            Log.LogWarning("Could not read network members from " + network.GetType().FullName);
+            return;
+        }
+        int found = 0;
+        int changed = 0;
+        foreach (object member in members)
+        {
+            if (member == null) continue;
+            found++;
+            int current = ReadColor(member);
+            if (current == color) continue;
+            if (ApplyColor(member, color))
             {
-                Logger.LogError("No color-change methods could be patched; plugin disabled.");
-                enabled = false;
-                return;
+                changed++;
+                if (member is UnityEngine.Object uo) lastColors[uo.GetInstanceID()] = color;
             }
-
-            Logger.LogInfo("Network Painter Server ready. Patched " + patched + " color method(s). Vanilla clients require no mod.");
         }
+        Log.LogInfo("Network paint: found " + found + " member(s), changed " + changed + ".");
+    }
 
-        private int PatchColorMethods()
+    private object GetNetwork(object obj)
+    {
+        try { object n = cableNetworkProp?.GetValue(obj, null); if (n != null) return n; } catch { }
+        try { object n = pipeNetworkProp?.GetValue(obj, null); if (n != null) return n; } catch { }
+        try { object n = chuteNetworkProp?.GetValue(obj, null); if (n != null) return n; } catch { }
+        return null;
+    }
+
+    private IEnumerable GetMembers(object network)
+    {
+        Type t = network.GetType();
+        string[] names = { "StructureList", "Structures", "NetworkList", "ConnectedStructures", "Members" };
+        foreach (string name in names)
         {
-            var seen = new HashSet<MethodBase>();
-            var targets = new List<MethodBase>();
-            for (Type t = _structureType; t != null; t = t.BaseType)
-            {
-                foreach (var m in t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
-                {
-                    if (m.Name == "SetCustomColor" || m.Name == "SetCustomColour" || m.Name == "set_CustomColorIndex" || m.Name == "set_CustomColourIndex")
-                    {
-                        if (seen.Add(m)) targets.Add(m);
-                    }
-                }
-            }
-
-            var postfix = new HarmonyMethod(typeof(NetworkPainterServerPlugin).GetMethod(nameof(ColorChangedPostfix), BindingFlags.Static | BindingFlags.NonPublic));
-            int count = 0;
-            foreach (var m in targets)
-            {
-                try
-                {
-                    _harmony.Patch(m, postfix: postfix);
-                    Logger.LogInfo("Patched color hook: " + m.DeclaringType.FullName + "." + m.Name);
-                    count++;
-                }
-                catch (Exception e)
-                {
-                    Logger.LogWarning("Could not patch " + m.DeclaringType.FullName + "." + m.Name + ": " + e.Message);
-                }
-            }
-            return count;
-        }
-
-        private static void ColorChangedPostfix(object __instance)
-        {
-            var p = Instance;
-            if (p == null || p._propagating || __instance == null) return;
-            if (!p._structureType.IsInstanceOfType(__instance)) return;
-            p.Queue(__instance);
-        }
-
-        private void Queue(object structure)
-        {
-            var uo = structure as UnityEngine.Object;
-            if (uo == null) return;
-            int id = uo.GetInstanceID();
-            if (_queued.Add(id)) _pending.Enqueue(structure);
-        }
-
-        private void Update()
-        {
-            if (_propagating || _pending.Count == 0 || Time.unscaledTime < _nextProcess) return;
-            _nextProcess = Time.unscaledTime + 0.05f;
-
-            object source = _pending.Dequeue();
-            var uo = source as UnityEngine.Object;
-            if (uo != null) _queued.Remove(uo.GetInstanceID());
-            if (uo == null) return;
-
-            object color;
-            if (!TryGetColor(source, out color)) return;
-            Propagate(source, color);
-        }
-
-        private void Propagate(object source, object color)
-        {
-            var networks = GetNetworks(source).Where(n => n != null).Distinct().ToArray();
-            if (networks.Length == 0) return;
-
-            _propagating = true;
             try
             {
-                int touched = 0;
-                var done = new HashSet<int>();
-                foreach (var network in networks)
+                PropertyInfo p = AccessTools.Property(t, name);
+                if (p != null && p.GetValue(network, null) is IEnumerable pe) return pe;
+                FieldInfo f = AccessTools.Field(t, name);
+                if (f != null && f.GetValue(network) is IEnumerable fe) return fe;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private bool ApplyColor(object obj, int color)
+    {
+        try
+        {
+            MethodInfo m = AccessTools.Method(obj.GetType(), "SetCustomColor") ?? AccessTools.Method(obj.GetType().BaseType, "SetCustomColor");
+            if (m != null)
+            {
+                ParameterInfo[] ps = m.GetParameters();
+                if (ps.Length == 1)
                 {
-                    foreach (var member in GetStructureList(network))
-                    {
-                        var uo = member as UnityEngine.Object;
-                        if (uo == null) continue;
-                        int id = uo.GetInstanceID();
-                        if (!done.Add(id)) continue;
-
-                        object existing;
-                        if (TryGetColor(member, out existing) && ColorsEqual(existing, color)) continue;
-                        if (ApplyColor(member, color)) touched++;
-                    }
-                }
-                if (touched > 0) Logger.LogInfo("Network paint propagated to " + touched + " connected structure(s).");
-            }
-            catch (Exception e)
-            {
-                Logger.LogError("Network paint failed: " + e);
-            }
-            finally
-            {
-                _propagating = false;
-                _pending.Clear();
-                _queued.Clear();
-            }
-        }
-
-        private IEnumerable<object> GetNetworks(object structure)
-        {
-            Type t = structure.GetType();
-            foreach (string name in NetworkNames)
-            {
-                object network = GetMemberValue(t, structure, name);
-                if (network != null) yield return network;
-            }
-        }
-
-        private IEnumerable<object> GetStructureList(object network)
-        {
-            object list = GetMemberValue(network.GetType(), network, "StructureList");
-            var enumerable = list as IEnumerable;
-            if (enumerable == null) yield break;
-            foreach (object item in enumerable) if (item != null) yield return item;
-        }
-
-        private static bool TryGetColor(object obj, out object color)
-        {
-            Type t = obj.GetType();
-            color = GetMemberValue(t, obj, "CustomColorIndex") ??
-                    GetMemberValue(t, obj, "CustomColourIndex") ??
-                    GetMemberValue(t, obj, "customColourIndex") ??
-                    GetMemberValue(t, obj, "ColorIndex") ??
-                    GetMemberValue(t, obj, "ColourIndex");
-            return color != null;
-        }
-
-        private static bool ApplyColor(object obj, object color)
-        {
-            Type t = obj.GetType();
-            foreach (var m in EnumerateMethods(t, "SetCustomColor", "SetCustomColour").OrderBy(x => x.GetParameters().Length))
-            {
-                var p = m.GetParameters();
-                if (p.Length == 0) continue;
-                object first;
-                if (!TryConvert(color, p[0].ParameterType, out first)) continue;
-
-                var args = new object[p.Length];
-                args[0] = first;
-                for (int i = 1; i < p.Length; i++)
-                {
-                    if (p[i].HasDefaultValue) args[i] = p[i].DefaultValue;
-                    else if (p[i].ParameterType == typeof(bool)) args[i] = true;
-                    else if (p[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(p[i].ParameterType);
-                    else args[i] = null;
-                }
-                try
-                {
-                    m.Invoke(obj, args);
+                    m.Invoke(obj, new object[] { ConvertArgument(color, ps[0].ParameterType) });
                     return true;
                 }
-                catch { }
-            }
-
-            return SetMemberValue(t, obj, "CustomColorIndex", color) ||
-                   SetMemberValue(t, obj, "CustomColourIndex", color) ||
-                   SetMemberValue(t, obj, "customColourIndex", color);
-        }
-
-        private static IEnumerable<MethodInfo> EnumerateMethods(Type t, params string[] names)
-        {
-            var set = new HashSet<string>(names);
-            for (Type cur = t; cur != null; cur = cur.BaseType)
-            {
-                foreach (var m in cur.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
-                    if (set.Contains(m.Name)) yield return m;
-            }
-        }
-
-        private static object GetMemberValue(Type t, object instance, string name)
-        {
-            const BindingFlags f = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
-            for (Type cur = t; cur != null; cur = cur.BaseType)
-            {
-                try
+                if (ps.Length == 2)
                 {
-                    var p = cur.GetProperty(name, f);
-                    if (p != null && p.GetIndexParameters().Length == 0) return p.GetValue(instance, null);
-                    var field = cur.GetField(name, f);
-                    if (field != null) return field.GetValue(instance);
+                    object arg0 = ConvertArgument(color, ps[0].ParameterType);
+                    object arg1 = ps[1].ParameterType == typeof(bool) ? (object)true : ps[1].HasDefaultValue ? ps[1].DefaultValue : Activator.CreateInstance(ps[1].ParameterType);
+                    m.Invoke(obj, new object[] { arg0, arg1 });
+                    return true;
                 }
-                catch { }
             }
-            return null;
-        }
-
-        private static bool SetMemberValue(Type t, object instance, string name, object value)
-        {
-            const BindingFlags f = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
-            for (Type cur = t; cur != null; cur = cur.BaseType)
+            PropertyInfo p = AccessTools.Property(obj.GetType(), "CustomColorIndex") ?? AccessTools.Property(obj.GetType().BaseType, "CustomColorIndex");
+            if (p != null && p.CanWrite)
             {
-                try
-                {
-                    var p = cur.GetProperty(name, f);
-                    if (p != null && p.CanWrite)
-                    {
-                        object converted;
-                        if (TryConvert(value, p.PropertyType, out converted)) { p.SetValue(instance, converted, null); return true; }
-                    }
-                    var field = cur.GetField(name, f);
-                    if (field != null && !field.IsInitOnly)
-                    {
-                        object converted;
-                        if (TryConvert(value, field.FieldType, out converted)) { field.SetValue(instance, converted); return true; }
-                    }
-                }
-                catch { }
-            }
-            return false;
-        }
-
-        private static bool TryConvert(object value, Type target, out object converted)
-        {
-            converted = null;
-            if (value == null) return !target.IsValueType;
-            Type src = value.GetType();
-            if (target.IsAssignableFrom(src)) { converted = value; return true; }
-            try
-            {
-                if (target.IsEnum) { converted = Enum.ToObject(target, Convert.ToInt32(value)); return true; }
-                if (src.IsEnum) { converted = Convert.ChangeType(Convert.ToInt32(value), target); return true; }
-                converted = Convert.ChangeType(value, target);
+                p.SetValue(obj, ConvertArgument(color, p.PropertyType), null);
                 return true;
             }
-            catch { return false; }
         }
-
-        private static bool ColorsEqual(object a, object b)
+        catch (Exception e)
         {
-            if (ReferenceEquals(a, b)) return true;
-            if (a == null || b == null) return false;
-            try { return Convert.ToInt32(a) == Convert.ToInt32(b); }
-            catch { return a.Equals(b); }
+            Log.LogWarning("Failed to apply color: " + e.GetType().Name + ": " + e.Message);
         }
+        return false;
+    }
 
-        private static Type FindType(string fullName)
-        {
-            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                try { var t = a.GetType(fullName, false); if (t != null) return t; }
-                catch { }
-            }
-            return null;
-        }
-
-        private static Type FindTypeByName(string name)
-        {
-            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if (!string.Equals(a.GetName().Name, "Assembly-CSharp", StringComparison.OrdinalIgnoreCase)) continue;
-                try
-                {
-                    foreach (var t in a.GetTypes()) if (t.Name == name && typeof(UnityEngine.Object).IsAssignableFrom(t)) return t;
-                }
-                catch { }
-            }
-            return null;
-        }
-
-        private void OnDestroy()
-        {
-            try { if (_harmony != null) _harmony.UnpatchSelf(); } catch { }
-            if (ReferenceEquals(Instance, this)) Instance = null;
-        }
+    private object ConvertArgument(int color, Type targetType)
+    {
+        if (targetType == typeof(int)) return color;
+        if (targetType.IsEnum) return Enum.ToObject(targetType, color);
+        return Convert.ChangeType(color, targetType);
     }
 }
